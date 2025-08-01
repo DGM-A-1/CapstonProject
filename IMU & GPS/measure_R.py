@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+gps_bias_estimation_gpsd.py
+
+DGPS?? ?????? GPSD ???????? ????????
+???? ??????(????)?? ???? ????????, ?????? ???????? ????.
+"""
+
+import time
+import numpy as np
+import gpsd
+from geopy.distance import geodesic
+
+
+
+def collect_gps_samples(initial_delay_s: float,
+                        measure_duration_s: float,
+                        host: str = 'localhost',
+                        port: int = 2947,
+                        poll_interval: float = 0.2) -> np.ndarray:
+    """
+    GPSD???? DGPS ?????? ?????? ???????? ????.
+    1) initial_delay_s ?? ???? ???? ???????? ????
+    2) measure_duration_s ?? ???? ??????
+    3) (N,2) ?????? [lat, lon] np.ndarray ????
+    """
+    try:
+        gpsd.connect(host=host, port=port)
+        print(f"Connected to gpsd at {host}:{port}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to gpsd at {host}:{port}: {e}")
+
+    # 1) ???? ????: ??????
+    t0 = time.time()
+    while time.time() - t0 < initial_delay_s:
+        try:
+            gpsd.get_current()
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+    # 2) ???? ????
+    coords = []
+    t1 = time.time()
+    while time.time() - t1 < measure_duration_s:
+        try:
+            report = gpsd.get_current()
+            lat = getattr(report, 'lat', None)
+            lon = getattr(report, 'lon', None)
+            if lat and lon and lat != 0 and lon != 0:
+                coords.append((lat, lon))
+        except Exception:
+            continue
+        time.sleep(poll_interval)
+
+    return np.array(coords)
+
+
+def compute_mode_latlon(coords: np.ndarray, bins: int = 60) -> tuple:
+    """
+    ?????? ???????? 2D ?????????? ???? ??, ???? ?? ???? ????
+    """
+    lats = coords[:, 0]
+    lons = coords[:, 1]
+    H, lon_edges, lat_edges = np.histogram2d(lons, lats, bins=bins)
+    i_lon, i_lat = np.unravel_index(np.argmax(H), H.shape)
+    mode_lon = (lon_edges[i_lon] + lon_edges[i_lon+1]) / 2
+    mode_lat = (lat_edges[i_lat] + lat_edges[i_lat+1]) / 2
+    return mode_lat, mode_lon
+
+
+def compute_variance_latlon(coords: np.ndarray) -> tuple:
+    """
+    ?????? ?????? ????????(var_lat, var_lon) ????
+    """
+    var_lat = np.var(coords[:, 0], ddof=1)
+    var_lon = np.var(coords[:, 1], ddof=1)
+    return var_lat, var_lon
+
+def compute_variance_meters(coords: np.ndarray, mode_lat: float, mode_lon: float):
+    # ???? ???? ???? (???? ????)
+    lat_dists_m = np.array([
+        geodesic((mode_lat, mode_lon), (lat, mode_lon)).meters
+        for lat in coords[:, 0]
+    ])
+    # ???? ???? ???? (???? ????)
+    lon_dists_m = np.array([
+        geodesic((mode_lat, mode_lon), (mode_lat, lon)).meters
+        for lon in coords[:, 1]
+    ])
+    # ???????? ddof=1
+    var_lat_m2 = np.var(lat_dists_m, ddof=1)
+    var_lon_m2 = np.var(lon_dists_m, ddof=1)
+    return var_lat_m2, var_lon_m2
+
+def compute_bias_meters(mode_lat: float, mode_lon: float, true_lat: float, true_lon: float) -> tuple:
+    """
+    ?????? bias(deg)?? ????(m) ?????? ????
+    ???? signed distance ????
+    """
+    lat_dist = geodesic((mode_lat, mode_lon), (true_lat, mode_lon)).meters
+    lat_sign = np.sign(mode_lat - true_lat)
+    lat_bias_m = lat_sign * lat_dist
+    
+    lon_dist = geodesic((mode_lat, mode_lon), (mode_lat, true_lon)).meters
+    lon_sign = np.sign(mode_lon - true_lon)
+    lon_bias_m = lon_sign * lon_dist
+    
+    return lat_bias_m, lon_bias_m
+
+if __name__ == '__main__':
+    # ?????? ????????
+    INITIAL_DELAY = 60.0        # ???? ???? [??]
+    MEASURE_DURATION = 300.0    # ???? ???? [??]
+    TRUE_LAT, TRUE_LON = 35.8875834, 128.6117572  # ???? ????
+
+    # 1) ???? ???? (GPSD)
+    samples = collect_gps_samples(
+        initial_delay_s=INITIAL_DELAY,
+        measure_duration_s=MEASURE_DURATION,
+        host='localhost',
+        port=2947,
+        poll_interval=0.2
+    )
+    if samples.size == 0:
+        raise RuntimeError("GPS ???????? ???????? ??????????.")
+
+    # 2) ??????????(????) ????
+    mode_lat, mode_lon = compute_mode_latlon(samples, bins=60)
+
+    # 3) ???????? ????: (???? ????) - (???? ????)
+    bias_lat = mode_lat - TRUE_LAT
+    bias_lon = mode_lon - TRUE_LON
+    
+    # 3-1) ????????(m) ?????? ????
+    bias_lat_m, bias_lon_m = compute_bias_meters(mode_lat, mode_lon, TRUE_LAT, TRUE_LON)
+
+    # 4) ???? ???? ?? ???? ???? R?? ????
+    # meters ????
+    var_lat, var_lon = compute_variance_meters(samples, mode_lat, mode_lon)
+
+    # ???? ????
+    print(f"Representative (mode)   : {mode_lat:.6f}, {mode_lon:.6f}")
+    print(f"True origin coordinate  : {TRUE_LAT:.6f}, {TRUE_LON:.6f}")
+    print(f"Bias (m)              : ??lat={bias_lat_m:.6e}, ??lon={bias_lon_m:.6e}")
+    print(f"Variance (m??)           : var_lat={var_lat:.6e}, var_lon={var_lon:.6e}")
+    print("?? Kalman filter R matrix = diag(var_lat, var_lon)")
